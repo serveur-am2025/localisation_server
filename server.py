@@ -8,45 +8,61 @@ import os
 # Configuration
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'votre_cle_secrete_lampadaire_2024')
-CORS(app, resources={r"/*": {"origins": "*"}})
 
-# ✅ Configuration SocketIO pour Render (avec threading)
+# ✅ CORS amélioré pour Android
+CORS(app, resources={
+    r"/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
+
+# ✅ Configuration SocketIO optimisée pour Render + Android
 socketio = SocketIO(
     app, 
     cors_allowed_origins="*",
-    async_mode='threading',  # Important pour Render
+    async_mode='threading',
     logger=True,
     engineio_logger=True,
-    ping_timeout=60,
-    ping_interval=25
+    ping_timeout=120,  # Augmenté pour connexions lentes
+    ping_interval=25,
+    max_http_buffer_size=1e8,  # Augmentation buffer
+    transports=['websocket', 'polling'],  # Support fallback polling
+    always_connect=True
 )
 
-# Configuration des logs
+# Configuration des logs améliorée
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Stockage temporaire des lampadaires connectés
+# Stockage temporaire
 connected_lampadaires = {}
-connected_clients = set()
+connected_clients = {}
+esp_status = {}
 
 # =================== HTTP ROUTES ===================
 
 @app.route('/', methods=['GET'])
 def index():
-    """Page d'accueil du serveur"""
     return jsonify({
         'message': 'Serveur Lampadaires Solaires Actif',
-        'version': '2.0',
+        'version': '2.1',
+        'status': 'healthy',
         'endpoints': {
+            'health': '/api/health',
             'update': '/api/lampadaire/update',
             'alert': '/api/alert',
             'websocket': '/lampadaires'
         },
-        'connected_lampadaires': len(connected_lampadaires),
-        'connected_clients': len(connected_clients)
+        'stats': {
+            'connected_lampadaires': len(connected_lampadaires),
+            'connected_clients': len(connected_clients),
+            'esp_devices': len(esp_status)
+        }
     })
 
 @app.route('/api/health', methods=['GET'])
@@ -54,12 +70,16 @@ def health_check():
     """Health check pour Render"""
     return jsonify({
         'status': 'healthy',
-        'timestamp': datetime.datetime.now().isoformat()
+        'timestamp': datetime.datetime.now().isoformat(),
+        'server': 'operational'
     }), 200
 
-@app.route('/api/lampadaire/update', methods=['POST'])
+@app.route('/api/lampadaire/update', methods=['POST', 'OPTIONS'])
 def update_lampadaire():
     """Receive lampadaire data from ESP32"""
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         data = request.json
         lamp_id = data.get('id')
@@ -67,18 +87,16 @@ def update_lampadaire():
         if not lamp_id:
             return jsonify({'error': 'ID lampadaire requis'}), 400
         
-        # Ajouter timestamp serveur
         data['server_timestamp'] = datetime.datetime.now().isoformat()
         data['synced'] = True
         
-        # Stocker temporairement
         connected_lampadaires[lamp_id] = data
         
         # Broadcast via WebSocket
         socketio.emit('lampadaire_update', {
             'type': 'lampadaire_update',
             'lampadaire': data
-        }, namespace='/lampadaires')
+        }, namespace='/lampadaires', broadcast=True)
         
         logger.info(f"✅ Lampadaire {lamp_id} mis à jour: {data.get('lieu', 'N/A')}")
         
@@ -92,21 +110,21 @@ def update_lampadaire():
         logger.error(f"❌ Erreur update lampadaire: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/alert', methods=['POST'])
+@app.route('/api/alert', methods=['POST', 'OPTIONS'])
 def create_alert():
     """Receive alert from ESP32"""
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         data = request.json
-        
-        # Ajouter timestamp serveur
         data['created_at'] = datetime.datetime.now().isoformat()
         data['server_received'] = True
         
-        # Broadcast via WebSocket
         socketio.emit('new_alert', {
             'type': 'new_alert',
             'alert': data
-        }, namespace='/lampadaires')
+        }, namespace='/lampadaires', broadcast=True)
         
         logger.warning(f"⚠️ Alerte: {data.get('type')} - Lampadaire #{data.get('lampadaire_id')}")
         
@@ -126,7 +144,12 @@ def create_alert():
 def handle_connect():
     """Handle client connections"""
     client_id = request.sid
-    connected_clients.add(client_id)
+    client_info = {
+        'sid': client_id,
+        'connected_at': datetime.datetime.now().isoformat(),
+        'remote_addr': request.remote_addr
+    }
+    connected_clients[client_id] = client_info
     
     logger.info(f"🔌 Client connecté: {client_id} (Total: {len(connected_clients)})")
     
@@ -137,18 +160,27 @@ def handle_connect():
         'connected_lampadaires': len(connected_lampadaires),
         'timestamp': datetime.datetime.now().isoformat()
     })
+    
+    # Envoyer l'état actuel des lampadaires
+    if connected_lampadaires:
+        for lamp_id, lamp_data in connected_lampadaires.items():
+            emit('lampadaire_update', {
+                'type': 'lampadaire_update',
+                'lampadaire': lamp_data
+            })
 
 @socketio.on('disconnect', namespace='/lampadaires')
 def handle_disconnect():
     """Handle client disconnections"""
     client_id = request.sid
-    connected_clients.discard(client_id)
+    if client_id in connected_clients:
+        del connected_clients[client_id]
     
     logger.info(f"🔌 Client déconnecté: {client_id} (Restant: {len(connected_clients)})")
 
 @socketio.on('auth', namespace='/lampadaires')
 def handle_authenticate(data):
-    """Authenticate ESP32 clients"""
+    """Authenticate ESP32/Android clients"""
     try:
         lampadaire_id = data.get('lampadaire_id')
         token = data.get('token')
@@ -160,7 +192,6 @@ def handle_authenticate(data):
             })
             return
         
-        # Simple token validation
         expected_token = f"lampadaire_token_{lampadaire_id}"
         
         if token == expected_token:
@@ -192,10 +223,9 @@ def handle_command(data):
         command = data.get('command')
         
         if not lamp_id or not command:
-            logger.error("❌ Commande invalide: ID ou commande manquant")
+            logger.error("❌ Commande invalide")
             return
         
-        # Envoyer commande au lampadaire spécifique
         room_name = f"lampadaire_{lamp_id}"
         
         emit('command', {
@@ -209,51 +239,19 @@ def handle_command(data):
     except Exception as e:
         logger.error(f"❌ Erreur command: {e}")
 
-@socketio.on('lampadaire_update', namespace='/lampadaires')
-def handle_lampadaire_update(data):
-    """Handle updates from ESP32 via WebSocket"""
-    try:
-        lampadaire_data = data.get('lampadaire')
-        
-        if lampadaire_data:
-            lamp_id = lampadaire_data.get('id')
-            connected_lampadaires[lamp_id] = lampadaire_data
-            
-            # Broadcast à tous les clients Android
-            emit('lampadaire_update', {
-                'type': 'lampadaire_update',
-                'lampadaire': lampadaire_data
-            }, broadcast=True)
-            
-            logger.info(f"🔄 Update WebSocket lampadaire #{lamp_id}")
-            
-    except Exception as e:
-        logger.error(f"❌ Erreur lampadaire_update: {e}")
-
-@socketio.on('alert', namespace='/lampadaires')
-def handle_alert(data):
-    """Handle alerts from ESP32 via WebSocket"""
-    try:
-        alert_data = data.get('alert')
-        
-        if alert_data:
-            alert_data['created_at'] = datetime.datetime.now().isoformat()
-            
-            # Broadcast à tous les clients Android
-            emit('new_alert', {
-                'type': 'new_alert',
-                'alert': alert_data
-            }, broadcast=True)
-            
-            logger.warning(f"⚠️ Alerte WebSocket: {alert_data.get('type')}")
-            
-    except Exception as e:
-        logger.error(f"❌ Erreur alert: {e}")
+@socketio.on('heartbeat', namespace='/lampadaires')
+def handle_heartbeat(data):
+    """Handle heartbeat from clients"""
+    client_id = request.sid
+    if client_id in connected_clients:
+        connected_clients[client_id]['last_heartbeat'] = datetime.datetime.now().isoformat()
+    
+    emit('heartbeat_ack', {'timestamp': datetime.datetime.now().isoformat()})
 
 # =================== DÉMARRAGE SERVEUR ===================
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))  # Render utilise PORT
+    port = int(os.environ.get('PORT', 10000))
     
     logger.info(f"""
     ==========================================
@@ -267,6 +265,6 @@ if __name__ == '__main__':
         app,
         host='0.0.0.0',
         port=port,
-        debug=False,  # False en production
+        debug=False,
         allow_unsafe_werkzeug=True
     )
